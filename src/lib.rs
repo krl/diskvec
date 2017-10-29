@@ -1,7 +1,7 @@
+#![deny(missing_docs)]
+//! A thread-safe, on-disk vector for Copy types.
 extern crate memmap;
 extern crate parking_lot;
-
-mod volatile;
 
 use std::{io, mem, ptr};
 use std::ops::{Deref, DerefMut};
@@ -14,12 +14,35 @@ use std::fs::File;
 use memmap::{Mmap, Protection};
 use parking_lot::{Mutex, MutexGuard};
 
-use volatile::Volatile;
+/// A trait restricting what kind of types can be put in the DiskVec
+///
+/// Apart from being `Copy`, the structure also assumes that a zero-valued
+/// instance of this type represents an empty slot in the memory mapped regions.
+pub trait Volatile
+where
+    Self: Copy + PartialEq,
+{
+    /// A representation of this type used as a placeholder.
+    /// Has to be represented by zeroes only.
+    const ZEROED: Self;
+}
 
 const RANKS: usize = 128;
 const LOCKS: usize = 1024;
 
-pub struct DiskArray<T: Volatile> {
+/// A concurrent on-disk vector for storing and manipulating `Volatile` types
+/// # Limitations
+/// * A value read from the diskarray might have been corrupted by faulty
+///   writes. For this reason, it is recommended that `T` carries its own
+///   checksum capability.
+/// * Write locks are done with a finite amount of mutexes, that may be less
+///   than the amount of elements in the vector, so deadlocks are possible even
+///   if you try to obtain mutable references to two different index positions.
+/// * Since reads are lock-free, there is no guarantee that the value you're
+///   holding a reference to will not change behind your back.
+/// # Guarantees
+/// * Writes are done using locks, so no writes will trample each other.
+pub struct DiskVec<T: Volatile> {
     ranks: [UnsafeCell<Option<Mmap>>; RANKS],
     initialized: AtomicUsize,
     rank_writelock: Mutex<()>,
@@ -29,8 +52,8 @@ pub struct DiskArray<T: Volatile> {
     _marker: PhantomData<T>,
 }
 
-unsafe impl<T: Volatile> Sync for DiskArray<T> {}
-unsafe impl<T: Volatile> Send for DiskArray<T> {}
+unsafe impl<T: Volatile> Sync for DiskVec<T> {}
+unsafe impl<T: Volatile> Send for DiskVec<T> {}
 
 fn min_max(rank: usize) -> (usize, usize) {
     if rank == 0 {
@@ -46,6 +69,7 @@ fn rank_ofs(index: usize) -> (usize, usize) {
     (rank, index - 2usize.pow(rank as u32))
 }
 
+/// A mutable reference into the DiskVec, carrying a guard
 pub struct MutableReference<'a, T>
 where
     T: 'a,
@@ -74,7 +98,8 @@ where
 }
 
 
-impl<T: Volatile> DiskArray<T> {
+impl<T: Volatile> DiskVec<T> {
+    /// Construct a new `DiskVec` given a path.
     pub fn new<P: Into<PathBuf> + Clone>(path: P) -> io::Result<Self> {
         unsafe {
             #[cfg(not(release))]
@@ -139,7 +164,7 @@ impl<T: Volatile> DiskArray<T> {
                 }
             }
 
-            Ok(DiskArray {
+            Ok(DiskVec {
                 ranks,
                 writelocks,
                 len: AtomicUsize::new(len),
@@ -151,6 +176,7 @@ impl<T: Volatile> DiskArray<T> {
         }
     }
 
+    /// Get a reference to the value at index
     pub fn get(&self, idx: usize) -> Option<&T> {
         let (rank, ofs) = rank_ofs(idx);
         if rank < self.initialized.load(Ordering::Relaxed) {
@@ -173,6 +199,7 @@ impl<T: Volatile> DiskArray<T> {
         }
     }
 
+    /// Get a mutable reference to the value at index
     pub fn get_mut(&self, idx: usize) -> Option<MutableReference<T>> {
         let (rank, ofs) = rank_ofs(idx);
         if rank < self.initialized.load(Ordering::Relaxed) {
@@ -198,10 +225,12 @@ impl<T: Volatile> DiskArray<T> {
         }
     }
 
+    /// returns the length of the `DiskVec`
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)
     }
 
+    /// Pushes an element to the `DiskVec`, returning the new index.
     pub fn push(&self, t: T) -> io::Result<usize> {
         #[cfg(not(release))]
         assert!(t != T::ZEROED, "Cannot insert zeroes!");
@@ -275,7 +304,7 @@ mod test {
     #[test]
     fn simple_diskarray() {
         let tempdir = TempDir::new("diskarray").unwrap();
-        let array = DiskArray::new(tempdir.path()).unwrap();
+        let array = DiskVec::new(tempdir.path()).unwrap();
 
         for i in 0..N {
             assert_eq!(array.push(CheckSummedUsize::new(i)).unwrap(), i);
@@ -293,7 +322,7 @@ mod test {
         let tempdir = TempDir::new("diskarray").unwrap();
 
         {
-            let array = DiskArray::new(tempdir.path()).unwrap();
+            let array = DiskVec::new(tempdir.path()).unwrap();
 
             for i in 0..N {
                 assert_eq!(array.push(CheckSummedUsize::new(i)).unwrap(), i);
@@ -302,7 +331,7 @@ mod test {
 
         {
             let array =
-                DiskArray::<CheckSummedUsize>::new(tempdir.path()).unwrap();
+                DiskVec::<CheckSummedUsize>::new(tempdir.path()).unwrap();
 
             for i in 0..N {
                 assert_eq!(array.get(i).unwrap(), &CheckSummedUsize::new(i))
@@ -315,7 +344,7 @@ mod test {
         for little_n in 0..100 {
             let tempdir = TempDir::new("diskarray").unwrap();
             {
-                let array = DiskArray::new(tempdir.path()).unwrap();
+                let array = DiskVec::new(tempdir.path()).unwrap();
 
                 for i in 0..little_n {
                     assert_eq!(
@@ -327,7 +356,7 @@ mod test {
 
             {
                 let array =
-                    DiskArray::<CheckSummedUsize>::new(tempdir.path()).unwrap();
+                    DiskVec::<CheckSummedUsize>::new(tempdir.path()).unwrap();
 
                 assert_eq!(array.len(), little_n);
             }
@@ -338,7 +367,7 @@ mod test {
     fn stress() {
         let tempdir = TempDir::new("diskarray").unwrap();
 
-        let array = Arc::new(DiskArray::new(tempdir.path()).unwrap());
+        let array = Arc::new(DiskVec::new(tempdir.path()).unwrap());
 
         let n_threads = 16;
         let mut handles = vec![];
@@ -362,7 +391,7 @@ mod test {
     #[test]
     fn mutable_access() {
         let tempdir = TempDir::new("diskarray").unwrap();
-        let array = Arc::new(DiskArray::new(tempdir.path()).unwrap());
+        let array = Arc::new(DiskVec::new(tempdir.path()).unwrap());
 
         for i in 0..N {
             assert_eq!(array.push(CheckSummedUsize::new(i)).unwrap(), i);
@@ -371,7 +400,7 @@ mod test {
         let n_threads = 16;
         let mut handles = vec![];
 
-        for thread in 0..n_threads {
+        for _ in 0..n_threads {
             let array = array.clone();
             handles.push(thread::spawn(move || for i in 0..N {
                 let mut old = array.get_mut(i).unwrap();

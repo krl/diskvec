@@ -1,6 +1,10 @@
 [package]
 authors = ["Kristoffer Ström <kristoffer@rymdkoloni.se>"]
-name = "diskarray"
+documentation = "https://docs.rs/diskvec/"
+description = "A thread-safe, on-disk vector for Copy types"
+repository = "https://github.com/krl/diskvec"
+license = "GPL-3.0"
+name = "diskvec"
 version = "0.1.0"
 
 [dependencies]
