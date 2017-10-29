@@ -3,11 +3,9 @@ extern crate oncemutex;
 
 mod volatile;
 
-use std::{cmp, io, mem, ptr};
+use std::{io, mem, ptr};
 use std::cell::UnsafeCell;
-use std::hash::Hash;
 use std::marker::PhantomData;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fs::File;
@@ -18,7 +16,6 @@ use oncemutex::OnceMutex;
 use volatile::Volatile;
 
 const RANKS: usize = 128;
-const NONE: usize = 0;
 
 pub struct DiskArray<T: Volatile> {
     ranks: [OnceMutex<Option<Mmap>>; RANKS],
@@ -42,7 +39,7 @@ fn rank_ofs(index: usize) -> (usize, usize) {
 }
 
 impl<T: Volatile> DiskArray<T> {
-    fn new<P: Into<PathBuf> + Clone>(path: P) -> io::Result<Self> {
+    pub fn new<P: Into<PathBuf> + Clone>(path: P) -> io::Result<Self> {
         unsafe {
             #[cfg(not(release))]
             {
@@ -145,7 +142,7 @@ impl<T: Volatile> DiskArray<T> {
                 let n_elements = 2usize.pow(rank as u32);
                 let size = mem::size_of::<T>() * n_elements;
                 file.set_len(size as u64)?;
-                let mut mmap = Mmap::open_path(&path, Protection::ReadWrite)?;
+                let mmap = Mmap::open_path(&path, Protection::ReadWrite)?;
                 *guard = Some(mmap);
             }
             None => (),
@@ -167,6 +164,8 @@ mod test {
     extern crate tempdir;
     use super::*;
     use self::tempdir::TempDir;
+    use self::std::sync::Arc;
+    use self::std::thread;
     const N: usize = 128;
 
     #[repr(C)]
@@ -252,6 +251,31 @@ mod test {
                 assert_eq!(array.len(), little_n);
             }
         }
+    }
+
+    #[test]
+    fn stress() {
+        let tempdir = TempDir::new("diskarray").unwrap();
+
+        let array = Arc::new(DiskArray::new(tempdir.path()).unwrap());
+
+        let n_threads = 16;
+        let mut handles = vec![];
+
+        for thread in 0..n_threads {
+            let array = array.clone();
+            handles.push(thread::spawn(move || for i in 0..N {
+                if i % n_threads == thread {
+                    array.push(CheckSummedUsize::new(i)).unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(array.len(), N);
     }
 
     #[test]
