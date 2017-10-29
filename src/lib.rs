@@ -40,6 +40,7 @@ const LOCKS: usize = 1024;
 ///   if you try to obtain mutable references to two different index positions.
 /// * Since reads are lock-free, there is no guarantee that the value you're
 ///   holding a reference to will not change behind your back.
+///
 /// # Guarantees
 /// * Writes are done using locks, so no writes will trample each other.
 pub struct DiskVec<T: Volatile> {
