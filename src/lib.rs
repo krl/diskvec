@@ -4,6 +4,7 @@ extern crate parking_lot;
 mod volatile;
 
 use std::{io, mem, ptr};
+use std::ops::{Deref, DerefMut};
 use std::marker::PhantomData;
 use std::cell::UnsafeCell;
 use std::path::PathBuf;
@@ -11,16 +12,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fs::File;
 
 use memmap::{Mmap, Protection};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use volatile::Volatile;
 
 const RANKS: usize = 128;
+const LOCKS: usize = 1024;
 
 pub struct DiskArray<T: Volatile> {
     ranks: [UnsafeCell<Option<Mmap>>; RANKS],
     initialized: AtomicUsize,
     rank_writelock: Mutex<()>,
+    writelocks: [Mutex<()>; LOCKS],
     path: PathBuf,
     len: AtomicUsize,
     _marker: PhantomData<T>,
@@ -43,6 +46,34 @@ fn rank_ofs(index: usize) -> (usize, usize) {
     (rank, index - 2usize.pow(rank as u32))
 }
 
+pub struct MutableReference<'a, T>
+where
+    T: 'a,
+{
+    reference: &'a mut T,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl<'a, T> Deref for MutableReference<'a, T>
+where
+    T: 'a,
+{
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.reference
+    }
+}
+
+impl<'a, T> DerefMut for MutableReference<'a, T>
+where
+    T: 'a,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.reference
+    }
+}
+
+
 impl<T: Volatile> DiskArray<T> {
     pub fn new<P: Into<PathBuf> + Clone>(path: P) -> io::Result<Self> {
         unsafe {
@@ -54,9 +85,13 @@ impl<T: Volatile> DiskArray<T> {
 
             let mut ranks: [UnsafeCell<Option<Mmap>>; RANKS] =
                 mem::uninitialized();
-
             for i in 0..RANKS {
                 ptr::write(&mut ranks[i], UnsafeCell::new(None))
+            }
+
+            let mut writelocks: [Mutex<()>; LOCKS] = mem::uninitialized();
+            for i in 0..LOCKS {
+                ptr::write(&mut writelocks[i], Mutex::new(()))
             }
 
             let mut n_ranks = 0;
@@ -106,6 +141,7 @@ impl<T: Volatile> DiskArray<T> {
 
             Ok(DiskArray {
                 ranks,
+                writelocks,
                 len: AtomicUsize::new(len),
                 initialized: AtomicUsize::new(n_ranks),
                 rank_writelock: Mutex::new(()),
@@ -130,6 +166,31 @@ impl<T: Volatile> DiskArray<T> {
                     None
                 } else {
                     Some(mem::transmute(ptr))
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_mut(&self, idx: usize) -> Option<MutableReference<T>> {
+        let (rank, ofs) = rank_ofs(idx);
+        if rank < self.initialized.load(Ordering::Relaxed) {
+            unsafe {
+                let ptr: *mut T = mem::transmute(
+                    (*self.ranks[rank].get())
+                        .as_ref()
+                        .expect("accessing uninitialized rank")
+                        .ptr(),
+                );
+                let ptr = ptr.offset(ofs as isize);
+                if *ptr == T::ZEROED {
+                    None
+                } else {
+                    Some(MutableReference {
+                        reference: mem::transmute(ptr),
+                        _guard: self.writelocks[idx % LOCKS].lock(),
+                    })
                 }
             }
         } else {
@@ -186,7 +247,7 @@ mod test {
     use self::tempdir::TempDir;
     use self::std::sync::Arc;
     use self::std::thread;
-    const N: usize = 100_000;
+    const N: usize = 1_000_000;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -296,6 +357,41 @@ mod test {
         }
 
         assert_eq!(array.len(), N);
+    }
+
+    #[test]
+    fn mutable_access() {
+        let tempdir = TempDir::new("diskarray").unwrap();
+        let array = Arc::new(DiskArray::new(tempdir.path()).unwrap());
+
+        for i in 0..N {
+            assert_eq!(array.push(CheckSummedUsize::new(i)).unwrap(), i);
+        }
+
+        let n_threads = 16;
+        let mut handles = vec![];
+
+        for thread in 0..n_threads {
+            let array = array.clone();
+            handles.push(thread::spawn(move || for i in 0..N {
+                let mut old = array.get_mut(i).unwrap();
+                *old = CheckSummedUsize {
+                    val: old.val + 1,
+                    checksum: old.checksum + 1,
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for i in 0..N {
+            assert_eq!(
+                array.get(i).unwrap(),
+                &CheckSummedUsize::new(i + n_threads)
+            )
+        }
     }
 
     #[test]
