@@ -1,27 +1,33 @@
 extern crate memmap;
-extern crate oncemutex;
+extern crate parking_lot;
 
 mod volatile;
 
-use std::{io, mem, ptr, thread};
+use std::{io, mem, ptr};
 use std::marker::PhantomData;
+use std::cell::UnsafeCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fs::File;
 
 use memmap::{Mmap, Protection};
-use oncemutex::OnceMutex;
+use parking_lot::Mutex;
 
 use volatile::Volatile;
 
 const RANKS: usize = 128;
 
 pub struct DiskArray<T: Volatile> {
-    ranks: [OnceMutex<Option<Mmap>>; RANKS],
+    ranks: [UnsafeCell<Option<Mmap>>; RANKS],
+    initialized: AtomicUsize,
+    rank_writelock: Mutex<()>,
     path: PathBuf,
     len: AtomicUsize,
     _marker: PhantomData<T>,
 }
+
+unsafe impl<T: Volatile> Sync for DiskArray<T> {}
+unsafe impl<T: Volatile> Send for DiskArray<T> {}
 
 fn min_max(rank: usize) -> (usize, usize) {
     if rank == 0 {
@@ -46,12 +52,13 @@ impl<T: Volatile> DiskArray<T> {
                 assert!(z == T::ZEROED, "Invalid Volatile implementation");
             }
 
-            let mut ranks: [OnceMutex<Option<Mmap>>; RANKS] =
+            let mut ranks: [UnsafeCell<Option<Mmap>>; RANKS] =
                 mem::uninitialized();
 
             for i in 0..RANKS {
-                ptr::write(&mut ranks[i], OnceMutex::new(None))
+                ptr::write(&mut ranks[i], UnsafeCell::new(None))
             }
+
             let mut n_ranks = 0;
             for rank in 0..RANKS {
                 let mut rank_path = path.clone().into();
@@ -60,10 +67,7 @@ impl<T: Volatile> DiskArray<T> {
                     n_ranks += 1;
                     let mmap =
                         Mmap::open_path(&rank_path, Protection::ReadWrite)?;
-                    //ptrs[rank] = mem::transmute(mmap.mut_ptr());
-                    *ranks[rank]
-                        .lock()
-                        .expect("Could not lock mutex in `new`") = Some(mmap);
+                    *ranks[rank].get() = Some(mmap);
                 } else {
                     break;
                 }
@@ -77,7 +81,10 @@ impl<T: Volatile> DiskArray<T> {
                     let (rank, ofs) = rank_ofs(probe);
 
                     let ptr: *const T = mem::transmute(
-                        ranks[rank].as_ref().expect("file disappeared!").ptr(),
+                        (*ranks[rank].get())
+                            .as_ref()
+                            .expect("accessing uninitialized rank")
+                            .ptr(),
                     );
                     let ptr = ptr.offset(ofs as isize);
                     if *ptr != T::ZEROED {
@@ -100,6 +107,8 @@ impl<T: Volatile> DiskArray<T> {
             Ok(DiskArray {
                 ranks,
                 len: AtomicUsize::new(len),
+                initialized: AtomicUsize::new(n_ranks),
+                rank_writelock: Mutex::new(()),
                 path: path.into(),
                 _marker: PhantomData,
             })
@@ -108,17 +117,23 @@ impl<T: Volatile> DiskArray<T> {
 
     pub fn get(&self, idx: usize) -> Option<&T> {
         let (rank, ofs) = rank_ofs(idx);
-        match *self.ranks[rank] {
-            Some(ref mmap) => unsafe {
-                let ptr: *const T = mem::transmute(mmap.ptr());
+        if rank < self.initialized.load(Ordering::Relaxed) {
+            unsafe {
+                let ptr: *const T = mem::transmute(
+                    (*self.ranks[rank].get())
+                        .as_ref()
+                        .expect("accessing uninitialized rank")
+                        .ptr(),
+                );
                 let ptr = ptr.offset(ofs as isize);
                 if *ptr == T::ZEROED {
                     None
                 } else {
                     Some(mem::transmute(ptr))
                 }
-            },
-            None => None,
+            }
+        } else {
+            None
         }
     }
 
@@ -133,8 +148,10 @@ impl<T: Volatile> DiskArray<T> {
         let idx = self.len.fetch_add(1, Ordering::Relaxed);
         let (rank, ofs) = rank_ofs(idx);
 
-        match self.ranks[rank].lock() {
-            Some(mut guard) => {
+        if rank >= self.initialized.load(Ordering::Relaxed) {
+            let _rank_writelock = self.rank_writelock.lock();
+            // is the rank still too small after aquiring the lock?
+            if rank >= self.initialized.load(Ordering::Relaxed) {
                 let mut path = self.path.clone();
                 path.push(format!("{:?}", rank));
                 let file = File::create(&path)?;
@@ -142,23 +159,18 @@ impl<T: Volatile> DiskArray<T> {
                 let size = mem::size_of::<T>() * n_elements;
                 file.set_len(size as u64)?;
                 let mmap = Mmap::open_path(&path, Protection::ReadWrite)?;
-                *guard = Some(mmap);
+                unsafe { *self.ranks[rank].get() = Some(mmap) }
+                self.initialized.fetch_add(1, Ordering::Relaxed);
             }
-            None => (),
         }
-        unsafe {
-            // spin until we get the initialized oncemutex
-            let ptr: *const T;
-            loop {
-                match self.ranks[rank].as_ref() {
-                    Some(mmap) => {
-                        ptr = mem::transmute(mmap.ptr());
-                        break;
-                    }
-                    None => thread::yield_now(),
-                }
-            }
 
+        unsafe {
+            let ptr: *const T = mem::transmute(
+                (*self.ranks[rank].get())
+                    .as_ref()
+                    .expect("accessing uninitialized rank")
+                    .ptr(),
+            );
             let ptr: *const T = ptr.offset(ofs as isize);
             let ptr: &mut T = mem::transmute(ptr);
             ptr::write(ptr, t);
