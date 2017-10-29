@@ -3,8 +3,7 @@ extern crate oncemutex;
 
 mod volatile;
 
-use std::{io, mem, ptr};
-use std::cell::UnsafeCell;
+use std::{io, mem, ptr, thread};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,7 +48,7 @@ impl<T: Volatile> DiskArray<T> {
 
             let mut ranks: [OnceMutex<Option<Mmap>>; RANKS] =
                 mem::uninitialized();
-            let mut ptrs: [UnsafeCell<*mut T>; RANKS] = mem::uninitialized();
+
             for i in 0..RANKS {
                 ptr::write(&mut ranks[i], OnceMutex::new(None))
             }
@@ -59,9 +58,9 @@ impl<T: Volatile> DiskArray<T> {
                 rank_path.push(format!("{}", rank));
                 if rank_path.exists() {
                     n_ranks += 1;
-                    let mut mmap =
+                    let mmap =
                         Mmap::open_path(&rank_path, Protection::ReadWrite)?;
-                    ptrs[rank] = mem::transmute(mmap.mut_ptr());
+                    //ptrs[rank] = mem::transmute(mmap.mut_ptr());
                     *ranks[rank]
                         .lock()
                         .expect("Could not lock mutex in `new`") = Some(mmap);
@@ -148,9 +147,18 @@ impl<T: Volatile> DiskArray<T> {
             None => (),
         }
         unsafe {
-            let ptr: *const T = mem::transmute(
-                self.ranks[rank].as_ref().expect("initialized").ptr(),
-            );
+            // spin until we get the initialized oncemutex
+            let ptr: *const T;
+            loop {
+                match self.ranks[rank].as_ref() {
+                    Some(mmap) => {
+                        ptr = mem::transmute(mmap.ptr());
+                        break;
+                    }
+                    None => thread::yield_now(),
+                }
+            }
+
             let ptr: *const T = ptr.offset(ofs as isize);
             let ptr: &mut T = mem::transmute(ptr);
             ptr::write(ptr, t);
@@ -166,7 +174,7 @@ mod test {
     use self::tempdir::TempDir;
     use self::std::sync::Arc;
     use self::std::thread;
-    const N: usize = 128;
+    const N: usize = 100_000;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq)]
