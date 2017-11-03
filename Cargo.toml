@@ -5,7 +5,7 @@ description = "A thread-safe, on-disk vector for Copy types"
 repository = "https://github.com/krl/diskvec"
 license = "GPL-3.0"
 name = "diskvec"
-version = "0.1.1"
+version = "0.1.2"
 
 [dependencies]
 memmap = "0.5.2"

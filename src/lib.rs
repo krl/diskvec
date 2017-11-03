@@ -101,8 +101,9 @@ where
 
 impl<T: Volatile> DiskVec<T> {
     /// Construct a new `DiskVec` given a path.
-    pub fn new<P: Into<PathBuf> + Clone>(path: P) -> io::Result<Self> {
+    pub fn new<P: Into<PathBuf>>(path: P) -> io::Result<Self> {
         unsafe {
+            let path = path.into();
             #[cfg(not(release))]
             {
                 let z: T = mem::zeroed();
@@ -122,7 +123,7 @@ impl<T: Volatile> DiskVec<T> {
 
             let mut n_ranks = 0;
             for rank in 0..RANKS {
-                let mut rank_path = path.clone().into();
+                let mut rank_path = path.clone();
                 rank_path.push(format!("{}", rank));
                 if rank_path.exists() {
                     n_ranks += 1;
